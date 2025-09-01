@@ -11,220 +11,239 @@
 #include "util/logger.hpp"
 #include "util/params.hpp"
 #include "util/random.hpp"
+#include "util/sys/subprocess.hpp"
 #include "util/sys/terminator.hpp"
 #include <algorithm>
 #include <bitset>
 #include <cmath>
+#define FMT_HEADER_ONLY
+#include <fmt/base.h>
+#include <fmt/format.h>
 #include <memory>
+#include <sys/wait.h>
 #include <vector>
 
 class CncController {
 
 private:
-    const Parameters& _params;
-    JobDescription& _desc;
-    std::vector<int> _base_formula;
+  const Parameters &_params;
+  JobDescription &_desc;
+  std::vector<int> _base_formula;
 
-    float _start_time;
+  float _start_time;
 
-    static int getNextStreamId() {
-        static int _stream_id = 1;
-        return _stream_id++;
-    }
+  static int getNextStreamId() {
+    static int _stream_id = 1;
+    return _stream_id++;
+  }
 
 public:
-    CncController(const Parameters& params, JobDescription& desc) : _params(params), _desc(desc) {
-        // Extract the base formula to solve.
-        _base_formula.insert(_base_formula.end(),
-            _desc.getFormulaPayload(0),
-            _desc.getFormulaPayload(0)+_desc.getFormulaPayloadSize(0));
-        LOG(V2_INFO, "CNC formula: %s\n", StringUtils::getSummary(_base_formula, 20).c_str());
+  CncController(const Parameters &params, JobDescription &desc)
+      : _params(params), _desc(desc) {
+    // Extract the base formula to solve.
+    _base_formula.insert(_base_formula.end(), _desc.getFormulaPayload(0),
+                         _desc.getFormulaPayload(0) +
+                             _desc.getFormulaPayloadSize(0));
+    LOG(V2_INFO, "CNC formula: %s\n",
+        StringUtils::getSummary(_base_formula, 20).c_str());
+  }
+
+  // Solves the provided SAT formula by means of Cube-and-Conquer.
+  JobResult solve() {
+    _start_time = Timer::elapsedSeconds();
+
+    // Prepare the dummy "I don't know" job result as a base case.
+    JobResult res;
+    res.id = _desc.getId();
+    res.revision = 0;
+    res.result = 0; // unknown
+
+    // Generate a set of cubes
+    int depth = _params.cubeSize.val; // 2^8 = 256 cubes
+    LOG(V2_INFO, "CNC generating cubes with depth %i\n", depth);
+    std::vector<std::vector<int>> cubes = getCubes(depth);
+    ::random_shuffle(cubes.data(), cubes.size()); // shuffle randomly
+    int nbGeneratedCubes = cubes.size();
+    int nbUnsatCubes = 0; // track number of cubes found UNSAT so far
+    LOG(V2_INFO, "CNC generated %i cubes\n", nbGeneratedCubes);
+
+    // Set up up to four SAT job streams, but no more than the global number of
+    // processes
+    std::vector<std::unique_ptr<WrappedSatJobStream>> streams;
+    int numConcStreams = std::min(4, MyMpi::size(MPI_COMM_WORLD));
+    for (int i = 0; i < numConcStreams; i++) {
+      streams.push_back(addJobStream());
+      // This line allows the stream to cross-share clauses
+      // with other streams of the same group ID and user name.
+      streams.back()->mallobProcessor->setGroupId(
+          "cnc-#" + std::to_string(_desc.getId()));
     }
 
-    // Solves the provided SAT formula by means of Cube-and-Conquer.
-    JobResult solve() {
-        _start_time = Timer::elapsedSeconds();
-
-        // Prepare the dummy "I don't know" job result as a base case.
-        JobResult res;
-        res.id = _desc.getId();
-        res.revision = 0;
-        res.result = 0; // unknown
-
-        // Generate a set of cubes
-        int depth = 8; // 2^8 = 256 cubes
-        LOG(V2_INFO, "CNC generating cubes with depth %i\n", depth);
-        std::vector<std::vector<int>> cubes = getCubes(depth);
-        ::random_shuffle(cubes.data(), cubes.size()); // shuffle randomly
-        int nbGeneratedCubes = cubes.size();
-        int nbUnsatCubes = 0; // track number of cubes found UNSAT so far
-        LOG(V2_INFO, "CNC generated %i cubes\n", nbGeneratedCubes);
-
-        // Set up up to four SAT job streams, but no more than the global number of processes
-        std::vector<std::unique_ptr<WrappedSatJobStream>> streams;
-        int numConcStreams = std::min(4, MyMpi::size(MPI_COMM_WORLD));
-        for (int i = 0; i < numConcStreams; i++) {
-            streams.push_back(addJobStream());
-            // This line allows the stream to cross-share clauses
-            // with other streams of the same group ID and user name.
-            streams.back()->mallobProcessor->setGroupId("cnc-#" + std::to_string(_desc.getId()));
-        }
-
-        // Repeatedly loop over all your streams, submitting cubes and fetching results,
-        // until a stopping criterion is reached.
-        bool stop = false;
-        while (!stop) {
-            for (auto& streamWrapper : streams) {
-                auto& stream = streamWrapper->stream;
-                // already cleaning up this stream?
-                if (stream.finalizing()) continue;
-                // result available?
-                if (!stream.isIdle() && !stream.isNonblockingSolvePending()) {
-                    // -- yes - retrieve it
-                    auto [code, witness] = stream.getNonblockingSolveResult();
-                    if (code == SAT) {
-                        // Cube was found satisfiable! We are done!
-                        LOG(V2_INFO, "CNC Cube SAT\n");
-                        LOG(V2_INFO, "CNC CONCLUDE SAT\n");
-                        res.result = SAT;
-                        res.setSolution(std::move(witness));
-                        stop = true;
-                        break;
-                    } else if (code == UNSAT) {
-                        // Cube was found unsatisfiable.
-                        LOG(V2_INFO, "CNC Cube UNSAT\n");
-                        nbUnsatCubes++;
-                        if (nbUnsatCubes == nbGeneratedCubes) {
-                            // All cubes found UNSAT. We are done!
-                            LOG(V2_INFO, "CNC CONCLUDE UNSAT\n");
-                            res.result = UNSAT;
-                            stop = true;
-                            break;
-                        }
-                    } else {
-                        // Cube solving returned UNKNOWN: something has gone wrong
-                        // or an internal limit was reached (timeout, interrupt, etc.)
-                        stop = true;
-                        break;
-                    }
-                }
-                // Is the stream idle right now?
-                if (stream.isIdle()) {
-                    // Try to submit next cube
-                    if (cubes.empty()) {
-                        // No cubes left to submit - yield this stream
-                        // TODO finalize can sometimes take longer - do concurrently instead?
-                        stream.interrupt();
-                        stream.finalize();
-                        continue;
-                    }
-                    // Remove next cube and submit it
-                    auto cube = cubes.back(); cubes.pop_back();
-                    submitCube(cube, stream);
-                    assert(!stream.isIdle());
-                }
+    // Repeatedly loop over all your streams, submitting cubes and fetching
+    // results, until a stopping criterion is reached.
+    bool stop = false;
+    while (!stop) {
+      for (auto &streamWrapper : streams) {
+        auto &stream = streamWrapper->stream;
+        // already cleaning up this stream?
+        if (stream.finalizing())
+          continue;
+        // result available?
+        if (!stream.isIdle() && !stream.isNonblockingSolvePending()) {
+          // -- yes - retrieve it
+          auto [code, witness] = stream.getNonblockingSolveResult();
+          if (code == SAT) {
+            // Cube was found satisfiable! We are done!
+            LOG(V2_INFO, "CNC Cube SAT\n");
+            LOG(V2_INFO, "CNC CONCLUDE SAT\n");
+            res.result = SAT;
+            res.setSolution(std::move(witness));
+            stop = true;
+            break;
+          } else if (code == UNSAT) {
+            // Cube was found unsatisfiable.
+            LOG(V2_INFO, "CNC Cube UNSAT\n");
+            nbUnsatCubes++;
+            if (nbUnsatCubes == nbGeneratedCubes) {
+              // All cubes found UNSAT. We are done!
+              LOG(V2_INFO, "CNC CONCLUDE UNSAT\n");
+              res.result = UNSAT;
+              stop = true;
+              break;
             }
+          } else {
+            // Cube solving returned UNKNOWN: something has gone wrong
+            // or an internal limit was reached (timeout, interrupt, etc.)
+            stop = true;
+            break;
+          }
         }
-
-        // RAII should take care of cleaning up all of the remaining job streams
-        // and their associated resources.
-        streams.clear();
-
-        return res;
+        // Is the stream idle right now?
+        if (stream.isIdle()) {
+          // Try to submit next cube
+          if (cubes.empty()) {
+            // No cubes left to submit - yield this stream
+            // TODO finalize can sometimes take longer - do concurrently
+            // instead?
+            stream.interrupt();
+            stream.finalize();
+            continue;
+          }
+          // Remove next cube and submit it
+          auto cube = cubes.back();
+          cubes.pop_back();
+          submitCube(cube, stream);
+          assert(!stream.isIdle());
+        }
+      }
     }
+
+    // RAII should take care of cleaning up all of the remaining job streams
+    // and their associated resources.
+    streams.clear();
+
+    return res;
+  }
 
 private:
-    // Generate a number of cubes exponential in the provided depth.
-    std::vector<std::vector<int>> getCubes(int depth) {
-        std::vector<std::vector<int>> cubes;
-        std::vector<int> vars = getSplittingVariables(depth);
-        // Just loop over all combinations of (depth) bits
-        // and use the splitting variables with according polarities.
-        for (size_t i = 0; i < (1<<depth); i++) {
-            std::bitset<64> bits(i);
-            std::vector<int> cube;
-            for (int j = 0; j < depth; j++) {
-                cube.push_back(vars[j] * (bits[j]?1:-1));
-            }
-            cubes.push_back(std::move(cube));
-        }
-        return cubes;
+  // Generate a number of cubes exponential in the provided depth.
+  std::vector<std::vector<int>> getCubes(int depth) {
+    string cnfname = _params.monoFilename.val;
+    int cutoffDepth = _params.cutoffDepth.val;
+
+    string args = fmt::format(
+        "--cnf {} --cube-size {} --cutoff "
+        "{} --log /dev/null --icnf tmp.icnf --cube-procs 10",
+        cnfname, depth, cutoffDepth);
+
+    Parameters _param;
+    // auto _subproc = new Subprocess(_param, "python3 lib/proofix/proofix.py", args);
+
+    auto _subproc = new Subprocess(_param, "foo.sh", args);
+    pid_t pid = _subproc->start();
+    if (waitpid(pid, NULL, 0) != 0) {
+
+    }
+    std::ifstream file("tmp.icnf");
+    if (!file.is_open()) {
+      std::cerr << "Failed to open file tmp.icnf\n";
+      exit(-1);
     }
 
-    // Select a set to variables to branch over.
-    std::vector<int> getSplittingVariables(int depth) {
+    std::vector<std::vector<int>> allLines;
+    std::string line;
 
-        // Collect # occurrences of each variable in the formula
-        std::vector<std::pair<int, int>> occurrences;
-        for (int lit : _base_formula) {
-            if (lit == 0) continue;
-            int var = std::abs(lit);
-            while (var >= occurrences.size())
-                occurrences.push_back({occurrences.size(), 0});
-            occurrences[var].second++;
-        }
+    while (std::getline(file, line)) {
+      std::istringstream iss(line);
+      std::string firstToken;
+      iss >> firstToken; // skip the first token (e.g., "a")
 
-        // Sort variables by occurrences in decending order
-        struct Compare {
-            bool operator()(const std::pair<int, int>& left, const std::pair<int, int>& right) {
-                return left.second > right.second;
-            }
-        };
-        std::sort(occurrences.begin(), occurrences.end(), Compare());
+      std::vector<int> numbers;
+      int num;
+      while (iss >> num) {
+        numbers.push_back(num);
+      }
 
-        // Return the first (depth) variables
-        std::vector<int> vars;
-        for (auto item : occurrences) {
-            if (item.first == 0) continue;
-            LOG(V2_INFO, "CNC var %i : %i occs\n", item.first, item.second);
-            vars.push_back(item.first);
-            if (vars.size() == depth) break;
-        }
-        return vars;
+      if (!numbers.empty()) {
+        numbers.pop_back();
+        allLines.push_back(numbers);
+      }
     }
+    return allLines;
+  }
 
-    // A bit of boilerplate code to get an incremental SAT solving task in Mallob up and running.
-    std::unique_ptr<WrappedSatJobStream> addJobStream() {
+  // A bit of boilerplate code to get an incremental SAT solving task in Mallob
+  // up and running.
+  std::unique_ptr<WrappedSatJobStream> addJobStream() {
 
-        // Every job stream needs a unique stream ID and a unique name
-        int streamId = getNextStreamId();
-        std::string name = "#" + std::to_string(_desc.getId()) + ":" + std::to_string(streamId) + "(SAT)";
+    // Every job stream needs a unique stream ID and a unique name
+    int streamId = getNextStreamId();
+    std::string name = "#" + std::to_string(_desc.getId()) + ":" +
+                       std::to_string(streamId) + "(SAT)";
 
-        // Create wrapper object for SAT job stream
-        std::unique_ptr<WrappedSatJobStream> wrapper(new WrappedSatJobStream(name));
+    // Create wrapper object for SAT job stream
+    std::unique_ptr<WrappedSatJobStream> wrapper(new WrappedSatJobStream(name));
 
-        // Add a stream processor that internally orchestrates a Mallob SAT task
-        wrapper->mallobProcessor = new MallobSatJobStreamProcessor(_params, APIRegistry::get(), _desc,
-            "#"+std::to_string(_desc.getId())+":SAT:mal", streamId, true, wrapper->stream.getSynchronizer());
-        wrapper->stream.addProcessor(wrapper->mallobProcessor);
+    // Add a stream processor that internally orchestrates a Mallob SAT task
+    wrapper->mallobProcessor = new MallobSatJobStreamProcessor(
+        _params, APIRegistry::get(), _desc,
+        "#" + std::to_string(_desc.getId()) + ":SAT:mal", streamId, true,
+        wrapper->stream.getSynchronizer());
+    wrapper->stream.addProcessor(wrapper->mallobProcessor);
 
-        // Add a stream processor that internally runs a single low-latency sequential solver
-        auto internalProcessor = new InternalSatJobStreamProcessor(true, wrapper->stream.getSynchronizer());
-        wrapper->stream.addProcessor(internalProcessor);
+    // Add a stream processor that internally runs a single low-latency
+    // sequential solver
+    auto internalProcessor = new InternalSatJobStreamProcessor(
+        true, wrapper->stream.getSynchronizer());
+    wrapper->stream.addProcessor(internalProcessor);
 
-        // Set the terminator for the stream
-        wrapper->stream.setTerminator([&, wrapper=wrapper.get()]() {
-            if (wrapper->stream.finalizing()) return true;
-            return isTimeoutHit();
-        });
+    // Set the terminator for the stream
+    wrapper->stream.setTerminator([&, wrapper = wrapper.get()]() {
+      if (wrapper->stream.finalizing())
+        return true;
+      return isTimeoutHit();
+    });
 
-        return wrapper;
-    }
+    return wrapper;
+  }
 
-    // Submit a formula together with the specified cube to the specified (idle!) SatJobStream.
-    void submitCube(const std::vector<int>& cube, SatJobStream& stream) {
-        std::vector<int> formula = _base_formula;
-        stream.solveNonblocking(std::move(formula), cube);
-    }
+  // Submit a formula together with the specified cube to the specified (idle!)
+  // SatJobStream.
+  void submitCube(const std::vector<int> &cube, SatJobStream &stream) {
+    std::vector<int> formula = _base_formula;
+    stream.solveNonblocking(std::move(formula), cube);
+  }
 
-    // Check whether this job should terminate right now.
-    bool isTimeoutHit() const {
-        if (Terminator::isTerminating())
-            return true;
-        if (_params.timeLimit() > 0 && Timer::elapsedSeconds() >= _params.timeLimit())
-            return true;
-        if (_desc.getWallclockLimit() > 0 && (Timer::elapsedSeconds() - _start_time) >= _desc.getWallclockLimit())
-            return true;
-        return false;
-    }
+  // Check whether this job should terminate right now.
+  bool isTimeoutHit() const {
+    if (Terminator::isTerminating())
+      return true;
+    if (_params.timeLimit() > 0 &&
+        Timer::elapsedSeconds() >= _params.timeLimit())
+      return true;
+    if (_desc.getWallclockLimit() > 0 &&
+        (Timer::elapsedSeconds() - _start_time) >= _desc.getWallclockLimit())
+      return true;
+    return false;
+  }
 };

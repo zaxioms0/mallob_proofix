@@ -14,6 +14,7 @@
 #include <fstream>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <iostream>
 
 /*
 Interface for starting subprocesses. Since some MPI stacks *hate* subprocessing
@@ -72,6 +73,7 @@ public:
         const std::string tmpFile = commandOutfile + "~";
         std::ofstream ofs(tmpFile);
         ofs << command;
+        std::cout << command << "\n";
         ofs.close();
         ::rename(tmpFile.c_str(), commandOutfile.c_str());
 
